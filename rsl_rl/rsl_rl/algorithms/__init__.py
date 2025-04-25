@@ -30,3 +30,4 @@
 
 from .ppo import PPO
 from .him_ppo import HIMPPO
+from .lidar_ppo import LidarPPO

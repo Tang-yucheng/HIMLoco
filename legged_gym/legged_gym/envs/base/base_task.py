@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import sys
+import keyboard
 from isaacgym import gymapi
 from isaacgym import gymutil
 import numpy as np
@@ -97,6 +98,9 @@ class BaseTask():
                 self.viewer, gymapi.KEY_ESCAPE, "QUIT")
             self.gym.subscribe_viewer_keyboard_event(
                 self.viewer, gymapi.KEY_V, "toggle_viewer_sync")
+            
+        self.prev_flags = {}
+        self.enable_voxel_map = False
 
     def get_observations(self):
         return self.obs_buf
@@ -123,12 +127,22 @@ class BaseTask():
             if self.gym.query_viewer_has_closed(self.viewer):
                 sys.exit()
 
-            # check for keyboard events
-            for evt in self.gym.query_viewer_action_events(self.viewer):
-                if evt.action == "QUIT" and evt.value > 0:
-                    sys.exit()
-                elif evt.action == "toggle_viewer_sync" and evt.value > 0:
-                    self.enable_viewer_sync = not self.enable_viewer_sync
+            # 读取配置文件
+            flags = read_flags()
+            if flags != self.prev_flags:
+                print("配置变更：", flags)
+                self.prev_flags = flags.copy()
+
+            self.enable_viewer_sync = flags["visualize"]
+            self.enable_voxel_map = flags["voxel_map"]
+
+            # # check for keyboard events
+            # for evt in self.gym.query_viewer_action_events(self.viewer):
+            #     if evt.action == "QUIT" and evt.value > 0:
+            #         sys.exit()
+            #     elif evt.action == "toggle_viewer_sync" and evt.value > 0:
+            #         self.enable_viewer_sync = not self.enable_viewer_sync
+            #         print(f"Visualization {'enabled' if self.enable_viewer_sync else 'disabled'}")
 
             # fetch results
             if self.device != 'cpu':
@@ -142,3 +156,23 @@ class BaseTask():
                     self.gym.sync_frame_time(self.sim)
             else:
                 self.gym.poll_viewer_events(self.viewer)
+
+# 设置文件路径
+VIS_FLAG_PATH = "/home/ubuntu/Desktop/vis_flag.txt"
+
+def read_flags(path=VIS_FLAG_PATH):
+    flags = {
+        "visualize": False,
+        "save": False,
+        "log": False
+    }
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line:
+                    key, val = line.split("=", 1)
+                    flags[key.strip()] = val.strip() == "1"
+    except FileNotFoundError:
+        print("配置文件不存在")
+    return flags

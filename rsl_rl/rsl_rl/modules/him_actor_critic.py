@@ -88,12 +88,18 @@ class HIMActorCritic(nn.Module):
 
         activation = get_activation(activation)
 
-        self.history_size = int(num_actor_obs/num_one_step_obs)
-        self.num_actor_obs = num_actor_obs
+        self.obs_with_lidar = True #True
+        self.lidar_dim = 187
+        self.history_size = 6 # int(num_actor_obs/num_one_step_obs)
+        
+        #self.num_actor_obs = num_actor_obs
         self.num_actions = num_actions
         self.num_one_step_obs = num_one_step_obs
 
-        mlp_input_dim_a = num_one_step_obs + 3 + 16
+        if self.obs_with_lidar:
+            mlp_input_dim_a = num_one_step_obs + 3 + 16 + self.lidar_dim
+        else:
+            mlp_input_dim_a = num_one_step_obs + 3 + 16
         mlp_input_dim_c = num_critic_obs
 
         # Estimator
@@ -124,9 +130,10 @@ class HIMActorCritic(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
+        print("him_actor_critic:")
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
-        print(f'Estimator: {self.estimator.encoder}')
+        # print(f'Estimator: {self.estimator.encoder}')
 
         # Action noise
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -165,8 +172,11 @@ class HIMActorCritic(nn.Module):
 
     def update_distribution(self, obs_history):
         with torch.no_grad():
-            vel, latent = self.estimator(obs_history)
-        actor_input = torch.cat((obs_history[:,:self.num_one_step_obs], vel, latent), dim=-1)
+            vel, latent = self.estimator(obs_history[:, :self.num_one_step_obs*self.history_size])
+        if self.obs_with_lidar:
+            actor_input = torch.cat((obs_history[:, :self.num_one_step_obs], vel, latent, obs_history[:, -self.lidar_dim:]), dim=-1)
+        else:
+            actor_input = torch.cat((obs_history[:, :self.num_one_step_obs], vel, latent), dim=-1)
         mean = self.actor(actor_input)
         self.distribution = Normal(mean, mean*0. + self.std)
 
@@ -178,8 +188,11 @@ class HIMActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, obs_history, observations=None):
-        vel, latent = self.estimator(obs_history)
-        actions_mean = self.actor(torch.cat((obs_history[:,:self.num_one_step_obs], vel, latent), dim=-1))
+        vel, latent = self.estimator(obs_history[:, :self.num_one_step_obs*self.history_size])
+        if self.obs_with_lidar:
+            actions_mean = self.actor(torch.cat((obs_history[:,:self.num_one_step_obs], vel, latent, obs_history[:, -self.lidar_dim:]), dim=-1))
+        else:
+            actions_mean = self.actor(torch.cat((obs_history[:,:self.num_one_step_obs], vel, latent), dim=-1))
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):

@@ -56,6 +56,11 @@ class HIMEstimator(nn.Module):
         # Optimizer
         self.learning_rate = learning_rate
         self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
+        
+        print("him_estimator:")
+        print(f'encoder: {self.encoder}')
+        print(f'target: {self.target}')
+        print(f'proto: {self.proto}')
 
     def get_latent(self, obs_history):
         vel, z = self.encode(obs_history)
@@ -82,7 +87,7 @@ class HIMEstimator(nn.Module):
         vel = next_critic_obs[:, self.num_one_step_obs:self.num_one_step_obs+3].detach()
         next_obs = next_critic_obs.detach()[:, 3:self.num_one_step_obs+3]
 
-        z_s = self.encoder(obs_history)
+        z_s = self.encoder(obs_history[:,:self.temporal_steps * self.num_one_step_obs])
         z_t = self.target(next_obs)
         pred_vel, z_s = z_s[..., :3], z_s[..., 3:]
 

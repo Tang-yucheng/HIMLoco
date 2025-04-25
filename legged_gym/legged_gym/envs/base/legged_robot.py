@@ -34,8 +34,11 @@ from warnings import WarningMessage
 import numpy as np
 import os
 
+import open3d as o3d
+
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
+from isaacgym.gymutil import LineGeometry
 
 import torch
 from torch import Tensor
@@ -47,6 +50,56 @@ from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float
 from legged_gym.utils.helpers import class_to_dict
 from .legged_robot_config import LeggedRobotCfg
+
+class My_WireframeBoxGeometry(LineGeometry):
+    def __init__(self, xdim=1, ydim=1, zdim=1, pose=None, color=None):
+        if color is None:
+            color = (1, 0, 0)
+        num_lines = 12
+        x = 0.5 * xdim
+        y = 0.5 * ydim
+        z = 0.5 * zdim
+        verts = np.empty((num_lines, 2), gymapi.Vec3.dtype)
+        # top face
+        verts[0][0] = (x, y, z)
+        verts[0][1] = (x, y, -z)
+        verts[1][0] = (-x, y, z)
+        verts[1][1] = (-x, y, -z)
+        verts[2][0] = (x, y, z)
+        verts[2][1] = (-x, y, z)
+        verts[3][0] = (x, y, -z)
+        verts[3][1] = (-x, y, -z)
+        # bottom face
+        verts[4][0] = (x, -y, z)
+        verts[4][1] = (x, -y, -z)
+        verts[5][0] = (-x, -y, z)
+        verts[5][1] = (-x, -y, -z)
+        verts[6][0] = (x, -y, z)
+        verts[6][1] = (-x, -y, z)
+        verts[7][0] = (x, -y, -z)
+        verts[7][1] = (-x, -y, -z)
+        # verticals
+        verts[8][0] = (x, y, z)
+        verts[8][1] = (x, -y, z)
+        verts[9][0] = (x, y, -z)
+        verts[9][1] = (x, -y, -z)
+        verts[10][0] = (-x, y, z)
+        verts[10][1] = (-x, -y, z)
+        verts[11][0] = (-x, y, -z)
+        verts[11][1] = (-x, -y, -z)
+        if pose is None:
+            self.verts = verts
+        else:
+            self.verts = pose.transform_points(verts)
+        colors = np.empty(num_lines, gymapi.Vec3.dtype)
+        colors.fill(color)
+        self._colors = colors
+    def vertices(self):
+        return self.verts
+    def colors(self):
+        return self._colors
+    def set_colors(self, color):
+        self._colors.fill(color)
 
 class LeggedRobot(BaseTask):
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
@@ -71,13 +124,22 @@ class LeggedRobot(BaseTask):
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
         self.num_one_step_obs = self.cfg.env.num_one_step_observations
         self.num_one_step_privileged_obs = self.cfg.env.num_one_step_privileged_obs
-        self.history_length = int(self.num_obs / self.num_one_step_obs)
+        self.history_length = self.cfg.env.history_length
+        
+        self.proprioceptive_obs_buf = torch.zeros(self.num_envs, self.num_one_step_obs*self.history_length, device=self.device, dtype=torch.float)
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
         self._prepare_reward_function()
         self.init_done = True
+
+        self._voxel_drawn = False
+        self._traversability_drawn = False
+        self._traversability_compute_count = 0
+
+        self._first_reset = False
+        self._first_one_index = 0
 
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
@@ -103,7 +165,6 @@ class LeggedRobot(BaseTask):
                 self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
         termination_ids, termination_priveleged_obs = self.post_physics_step()
-
         # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
@@ -123,6 +184,8 @@ class LeggedRobot(BaseTask):
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
+        # print(self.common_step_counter)
+
         # prepare quantities
         self.base_quat[:] = self.root_states[:, 3:7]
         self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
@@ -134,13 +197,68 @@ class LeggedRobot(BaseTask):
 
         self._post_physics_step_callback()
 
-        # compute observations, rewards, resets, ...
+
+        # # 体素地图光线投影
+        #     # 发射射线
+        # ray_results = self.gym.cast_rays(self.sim, None, self.origins_tensor, self.dirs_tensor)
+        #     # 获取命中点
+        # hit_pos = self.origins + ray_results['fractions'].unsqueeze(-1) * self.dirs_all
+        # hit_mask = ray_results['hits'].bool()
+        #     # 只处理目标环境
+        # env = self.envs[self.target_env_id]
+        # hits = hit_mask[self.target_env_id]
+        # hit_points = hit_pos[self.target_env_id][hits]
+        #     # 可视化体素地图
+        # for pt in hit_points:
+        #     x, y, z = pt.tolist()
+        #     color = gymapi.Vec3(0.0, 1.0, 0.0)  # 默认绿色
+        #     if z < 0.2:
+        #         color = gymapi.Vec3(1.0, 0.0, 0.0)  # 红色表示低洼或不可通行
+        #     center = gymapi.Vec3(x, y, z + 0.05)
+        #     extent = gymapi.Vec3(0.04, 0.04, 0.04)
+        #     gymutil.draw_box(center, extent, color, self.gym, self.viewer, env)
+
+        # compute observations, rewards, resets, ..
         self.check_termination()
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         termination_privileged_obs = self.compute_termination_observations(env_ids)
         self.reset_idx(env_ids)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
+
+
+
+
+        # 保持重置环境在15step内不记录奖励
+        max_count = 15
+        indices = torch.nonzero(self.reset_buf)
+        self.reset_count[indices] = max_count
+        self.reset_count = torch.where(self.reset_count > 0, self.reset_count - 1, torch.zeros_like(self.reset_count))
+        #     # 获取第一个为 1 的元素的索引
+        # indices = torch.nonzero(self.reset_buf)
+        #     # 如果找到了至少一个为 1 的元素
+        # if indices.numel() > 0 and self._first_reset == False:
+        #     self._first_one_index = indices[0].item()  # 获取第一个为 1 的元素的索引
+        #     self._first_reset = True
+        #     print("find first reset!")
+        # if self._first_reset:
+        #     print(f'env id: {self._first_one_index}, reward: {self.rew_buf[self._first_one_index]}')
+        # print(f'env id: {0}, reward: {self.rew_buf[0]}')
+
+        # 记录可通行性
+        self.record_traversability()
+        # 绘制高程体素
+        if self.enable_voxel_map:
+            # self.draw_voxel_terrain_surface()
+            # self.export_voxel_pointcloud()
+            self.export_traversability_voxel()
+        else:
+            # self.destory_voxel_terrain_surface()
+            if self._traversability_drawn:
+                self._traversability_drawn = False
+
+
+        
 
 
         self.disturbance[:, :, :] = 0.0
@@ -153,6 +271,381 @@ class LeggedRobot(BaseTask):
             self._draw_debug_vis()
 
         return env_ids, termination_privileged_obs
+    
+
+
+    
+    def record_traversability(self):
+        voxel_size = 0.1
+        box_half = voxel_size / 2.0
+        # 获取全部机器人当前投影体素
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        
+        # # 单环境统计
+        # occupy_points = quat_apply_yaw(self.base_quat[0].repeat(self.base_occupy_points.shape[0], 1), self.base_occupy_points) + (self.root_states[0, :3]).unsqueeze(0)
+        # # 按照成功次数统计
+        # if reset_ids[0]:
+        #     self.accumulate_2d_hits(occupy_points_index, self.num_fail)
+        #     # print(occupy_points_index)
+        # else:
+        #     self.accumulate_2d_hits(occupy_points_index, self.num_succeed)
+
+        # 全环境统计
+        occupy_points = quat_apply_yaw(self.base_quat.repeat(1, self.base_occupy_points.shape[0]), self.base_occupy_points.repeat(self.base_quat.shape[0], 1, 1)) + (self.root_states[:, :3]).unsqueeze(1)
+        occupy_points[:, :, 0] += self.cfg.terrain.border_size
+        occupy_points[:, :, 1] += self.cfg.terrain.border_size
+        occupy_points_index = occupy_points // voxel_size
+        # # 按照成功次数统计
+        # reset_ids = self.reset_buf * ~self.time_out_buf
+        # reset_mask = reset_ids.bool()
+        # if torch.any(reset_mask):
+        #     self.accumulate_2d_hits(occupy_points_index[reset_mask], self.num_fail)
+        # self.accumulate_2d_hits(occupy_points_index[~reset_mask], self.num_succeed)
+
+        # 滤除重置后15step以内的环境
+        mask = (self.reset_count == 0)
+        rew_buf_filtered = self.rew_buf[mask]
+        occupy_points_index_filtered = occupy_points_index[mask]
+        # print("-----------------------------------------------------------------")
+        # print(rew_buf_filtered.shape)
+        # print(occupy_points_index_filtered.shape)
+        # 按照奖励统计
+        self.accumulate_2d_rew(rew_buf_filtered, occupy_points_index_filtered, self.value_once, self.count_once)
+
+        # 大约 50 episode 计算一次
+        # # 按照成功次数统计
+        # if self.common_step_counter % 2500 == 0:
+        #     self._traversability_compute_count += 1
+        #     # 计算单批次可通行得分
+        #     total_once = self.num_succeed + self.num_fail
+        #     self.traversability_score += torch.where(total_once > 0, self.num_succeed / total_once, torch.zeros_like(total_once))
+        #     # 计算累计可通行得分
+        #     once_mask = torch.where(total_once != 0, torch.ones_like(total_once), torch.zeros_like(total_once))
+        #     self.num_total += once_mask
+        #     self.traversability_score_mean = torch.where(self.num_total > 0, self.traversability_score / self.num_total, torch.zeros_like(self.num_total))
+        #     # 成功失败buffer清零
+        #     self.num_succeed.zero_()
+        #     self.num_fail.zero_()
+        #     print("compute traversability once!")
+        # 按照奖励统计
+        if self.common_step_counter % 2500 == 0:
+            self._traversability_compute_count += 1
+            # 计算单批次可通行得分（***注意归一化时不要带着未遍历区域）
+                # 有效位置 mask
+            scores = torch.where(self.count_once > 0, self.value_once / self.count_once, torch.zeros_like(self.count_once))
+            valid_mask = self.count_once > 0
+                # 先提取有效区域
+            valid_scores = scores[valid_mask]
+                # 计算有效区域的 min/max
+            min_val = valid_scores.min()
+            max_val = valid_scores.max()
+                # 避免除 0
+            eps = 1e-6
+            norm_valid_scores = (valid_scores - min_val) / (max_val - min_val + eps)
+                # 创建归一化后的 scores，初始化为 0
+            normalized_scores = torch.zeros_like(scores)
+                # 只把有效区域赋值回去
+            normalized_scores[valid_mask] = norm_valid_scores
+                # 用 normalized_scores 替换原 scores
+            scores = normalized_scores
+            #     # 归一化scores
+            # eps = 1e-6
+            # scores = (scores - scores.min()) / (scores.max() - scores.min() + eps)
+            self.traversability_score += scores
+            # 计算累计可通行得分
+            once_mask = torch.where(self.count_once != 0, torch.ones_like(self.count_once), torch.zeros_like(self.count_once))
+            self.num_total += once_mask
+            self.traversability_score_mean = torch.where(self.num_total > 0, self.traversability_score / self.num_total, torch.zeros_like(self.num_total))
+
+            # 奖励累加值清零
+            self.value_once.zero_()
+            self.count_once.zero_()
+            print("compute traversability once!")
+
+
+        # # 可视化base投影
+        # cube_geom = My_WireframeBoxGeometry(
+        #     voxel_size*100, voxel_size*100, voxel_size*100,
+        # )
+        # occupy_points_index = occupy_points_index.cpu()
+        # for n in range(occupy_points_index.shape[0]):
+        #         i, j = int(occupy_points_index[n, 0].item()), int(occupy_points_index[n, 1].item())
+        #         height = self.height_map[i, j]
+        #         # 地图坐标转世界坐标
+        #         x = i * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+        #         y = j * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+        #         # 将实际高度对齐到 voxel 栅格中心
+        #         z_actual = height * self.cfg.terrain.vertical_scale# 中心在高度中心位置
+        #         z = int(z_actual / voxel_size) * voxel_size + box_half
+        #         cube_pose = gymapi.Transform()
+        #         cube_pose.p = gymapi.Vec3(x, y, z)
+        #         color = (1, 0, 0)
+        #         # 创建 wireframe cube
+        #         cube_geom.set_colors(color)
+        #         # 画 cube
+        #         gymutil.draw_lines(cube_geom, self.gym, self.viewer, self.envs[0], cube_pose)
+    
+    def accumulate_2d_rew(self, rew_buf, occupy_points_index, value_once, count_once):
+        # value_once: (X, Y) → 扁平化为 1D 张量用于 scatter
+        X, Y = value_once.shape
+        flat_value = value_once.view(-1)
+        flat_count = count_once.view(-1)
+        # 提取 x 和 y 索引
+        indices = occupy_points_index[:, :, :2].long()  # (4096, 15, 2)
+        # 展平为 (4096*15, 2)
+        indices_flat = indices.view(-1, 2)
+        x = indices_flat[:, 0]
+        y = indices_flat[:, 1]
+        # 创建合法掩码（可选：防止负数或越界）
+        mask = (x >= 0) & (x < X) & (y >= 0) & (y < Y)
+        x = x[mask]
+        y = y[mask]
+        # 计算线性索引
+        linear_idx = x * Y + y  # shape: [num_points_valid]
+        # 将 rew_buf 扩展为 [4096, 15] → flatten 成 [4096*15]
+        rew_flat = rew_buf.view(-1, 1).expand(-1, 15).reshape(-1)
+        # 同样过滤掉对应的奖励
+        rew_valid = rew_flat[mask]
+        # scatter add 到网格中（flat_value 是 X*Y 长度）
+        flat_value.scatter_add_(0, linear_idx, rew_valid)
+        flat_count.scatter_add_(0, linear_idx, torch.ones_like(rew_valid))
+
+    def accumulate_2d_hits(self, indices, map_2d):
+        """
+        indices: (N, 3) long tensor
+        map_2d: (X, Y) tensor，原地累加
+        """
+        X, Y = map_2d.shape
+        flat = map_2d.view(-1)
+        indices = indices.view(-1, 3)
+        linear_idx = indices[:, 0] * Y + indices[:, 1]
+        # 使用布尔索引去除负值的元素
+        mask = linear_idx >= 0
+        linear_idx = linear_idx[mask].long()
+        # print(f"Linear index min: {linear_idx.min()}, max: {linear_idx.max()}")
+        flat.scatter_add_(0, linear_idx, torch.ones_like(linear_idx, dtype=flat.dtype))
+
+    
+    def export_traversability_voxel(self, filename="/home/ubuntu/Desktop/traversability_voxel.ply"):
+
+        if self._traversability_drawn or self.height_samples is None:
+            return
+
+        start = time()
+        voxel_size = 0.1
+        box_half = voxel_size / 2.0
+
+        rows, cols = self.traversability_score_mean.shape
+        i, j = torch.meshgrid(torch.arange(rows), torch.arange(cols), indexing='ij')
+
+        x = i * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+        y = j * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+        z_actual = self.height_map * self.cfg.terrain.vertical_scale
+        z = (z_actual // voxel_size) * voxel_size + box_half
+        if isinstance(z, np.ndarray):
+            z = torch.from_numpy(z).to(x.device)  # 保证 z 是 Tensor，且和 x 在同一设备上
+
+        points = torch.stack([x, y, z], dim=-1).reshape(-1, 3)  # (N, 3)
+        scores = self.traversability_score_mean.reshape(-1)     # (N,)
+
+        # 颜色范围：红（失败）到蓝（成功）
+        # 红：(1, 0, 0), 蓝：(0, 0, 1)
+        colors = torch.stack([
+            1 - scores,           # R：高得分少红
+            torch.zeros_like(scores),  # G
+            scores                # B：得分越高越蓝
+        ], dim=1)  # shape: (N, 3)
+        
+        # 当 total == 0 时，将其颜色设为灰色
+        colors = torch.where(self.num_total.view(-1, 1) == 0, torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=colors.device), colors)
+
+        # 构造 Open3D 点云
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy().astype(np.float32))
+        pcd.colors = o3d.utility.Vector3dVector(colors.cpu().numpy().astype(np.float32))
+
+        # 保存为 .ply 文件
+        o3d.io.write_point_cloud(filename, pcd)
+        # o3d.io.write_point_cloud("smb://211.86.152.210/tiger-nas-readwrite/", pcd)
+        print(f"[PointCloud] Exported to {filename}, {points.shape[0]} points.")
+        self._traversability_drawn = True
+        end = time()
+        print(f"[VoxelDraw] Time: {end - start:.4f} s")
+    
+
+    def export_voxel_pointcloud(self, filename="/home/ubuntu/Desktop/voxel_surface.ply"):
+
+        if self._voxel_drawn or self.height_samples is None:
+            return
+
+        start = time()
+        voxel_size = 0.1
+        box_half = voxel_size / 2.0
+
+        # 高度图 tensor -> numpy
+        height_map = self.height_samples.cpu().numpy()
+        rows, cols = height_map.shape
+
+        i_indices, j_indices = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+        x_coords = i_indices * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+        y_coords = j_indices * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+        z_actual = height_map * self.cfg.terrain.vertical_scale
+        z_coords = (z_actual // voxel_size) * voxel_size + box_half
+
+        # 点坐标
+        points = np.stack([x_coords, y_coords, z_coords], axis=-1).reshape(-1, 3)
+
+        # 归一化颜色
+        max_h = np.max(height_map)
+        min_h = np.min(height_map)
+        range_h = max(max_h - min_h, 1e-5)
+        norm = (height_map - min_h) / range_h
+        r = norm
+        g = 1.0 - 0.5 * norm
+        b = np.zeros_like(norm)
+        colors = np.stack([r, g, b], axis=-1).reshape(-1, 3)
+
+        # 构造 Open3D 点云
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float32))
+        pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float32))
+
+        # 保存为 .ply 文件
+        o3d.io.write_point_cloud(filename, pcd)
+        # o3d.io.write_point_cloud("smb://211.86.152.210/tiger-nas-readwrite/", pcd)
+        print(f"[PointCloud] Exported to {filename}, {points.shape[0]} points.")
+        self._voxel_drawn = True
+        end = time()
+        print(f"[VoxelDraw] Time: {end - start:.4f} s")
+
+
+    
+    # def _get_octomap_style_color_vec(self, norm_heights):
+    #     """
+    #     批量计算颜色：从绿色 → 橙色，norm_heights 是 numpy 数组
+    #     """
+    #     r = norm_heights * 1.0
+    #     g = 1.0 - 0.5 * norm_heights
+    #     b = np.zeros_like(norm_heights)
+    #     return np.stack([r, g, b], axis=-1)
+
+    # def draw_voxel_terrain_surface(self):
+    #     """
+    #     在 Isaac Gym 中可视化 height_samples 的体素地形表面（只画每个栅格的顶部方块）
+    #     """
+    #     if self._voxel_drawn or self.height_samples is None:
+    #         return
+        
+    #     start = time()
+
+    #     self.gym.clear_lines(self.viewer)
+
+    #     voxel_size = 0.1
+    #     box_half = voxel_size / 2.0
+    #     height_map = self.height_samples.cpu().numpy()
+    #     rows, cols = height_map.shape
+
+    #     # 计算地图坐标
+    #     i_indices, j_indices = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+    #     x_coords = i_indices * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+    #     y_coords = j_indices * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+    #     z_actual = height_map * self.cfg.terrain.vertical_scale
+    #     z_coords = (z_actual // voxel_size) * voxel_size + box_half
+
+    #     # 归一化高度
+    #     max_height = np.max(height_map)
+    #     min_height = np.min(height_map)
+    #     height_range = max(max_height - min_height, 1e-5)
+    #     norm_heights = (height_map - min_height) / height_range
+
+    #     # 批量计算颜色
+    #     colors = self._get_octomap_style_color_vec(norm_heights)
+
+    #     cube_pose = gymapi.Transform()
+    #     cube_geom = My_WireframeBoxGeometry(
+    #         voxel_size, voxel_size, voxel_size,
+    #     )
+    #     # 遍历绘制体素 cube（仅画顶部）
+    #     for i in range(rows):
+    #         for j in range(cols):
+    #             cube_pose.p = gymapi.Vec3(
+    #                 float(x_coords[i, j]),
+    #                 float(y_coords[i, j]),
+    #                 float(z_coords[i, j])
+    #             )
+    #             color = tuple(colors[i, j])  # (r, g, b)
+    #             cube_geom.set_colors(color)
+    #             gymutil.draw_lines(cube_geom, self.gym, self.viewer, self.envs[0], cube_pose)
+    #     self._voxel_drawn = True
+    #     end = time()
+    #     print(f"[VoxelDraw] Time: {end - start:.4f} s")
+
+
+    # def _get_octomap_style_color(self, norm_z):
+    #     """
+    #     颜色从绿色 → 橙色，norm_z ∈ [0, 1]
+    #     """
+    #     r = norm_z * 1.0       # R: 从 0 到 1
+    #     g = 1.0 - 0.5 * norm_z # G: 从 1 到 0.5
+    #     b = 0.0                # B: 始终为 0
+    #     return (r, g, b)
+
+    # def draw_voxel_terrain_surface(self):
+    #     """
+    #     在 Isaac Gym 中可视化 height_samples 的体素地形表面（只画每个栅格的顶部方块）
+    #     """
+    #     if self._voxel_drawn:
+    #         return  # 避免重复执行
+    #     if self.height_samples is None:
+    #         return
+    #     self.gym.clear_lines(self.viewer)
+    #     start = time()
+    #     # 体素尺寸
+    #     voxel_size = 0.1
+    #     box_half = voxel_size / 2.0
+    #     # 取出 height_samples 并转换为 numpy
+    #     height_map = self.height_samples.cpu().numpy()
+    #     rows, cols = height_map.shape
+    #     # 获取最大高度用于归一化（防止全是0或很小的浮点数）
+    #     max_height = np.max(height_map)
+    #     min_height = np.min(height_map)
+    #     height_range = max(max_height - min_height, 1e-5)  # 防止除0
+    #     cube_geom = My_WireframeBoxGeometry(
+    #         voxel_size, voxel_size, voxel_size,
+    #     )
+    #     # 遍历每个格子，在其最高点画 cube
+    #     for i in range(rows):
+    #         for j in range(cols):
+    #             height = height_map[i, j]
+    #             # 地图坐标转世界坐标
+    #             x = i * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+    #             y = j * self.cfg.terrain.horizontal_scale - self.cfg.terrain.border_size
+    #             # 将实际高度对齐到 voxel 栅格中心
+    #             z_actual = height * self.cfg.terrain.vertical_scale# 中心在高度中心位置
+    #             z = int(z_actual / voxel_size) * voxel_size + box_half
+    #             cube_pose = gymapi.Transform()
+    #             cube_pose.p = gymapi.Vec3(x, y, z)
+    #             # 归一化高度到 [0, 1]
+    #             norm_h = (height - min_height) / height_range
+    #             color = self._get_octomap_style_color(norm_h)
+    #             # 创建 wireframe cube
+    #             cube_geom.set_colors(color)
+    #             # 画 cube
+    #             gymutil.draw_lines(cube_geom, self.gym, self.viewer, self.envs[0], cube_pose)
+    #     self._voxel_drawn = True  # 设置标志位
+    #     end = time()
+    #     print(f"[VoxelDraw] Time: {end - start:.4f} s")
+
+    def destory_voxel_terrain_surface(self):
+        """
+        """
+        if not self._voxel_drawn:
+            return  # 避免重复执行
+        if self.height_samples is None:
+            return
+        self.gym.clear_lines(self.viewer)
+        self._voxel_drawn = False
+
 
     def check_termination(self):
         """ Check if environments need to be reset
@@ -197,7 +690,7 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.measure_heights:
             self.measured_heights = self._get_heights()
         
-         #reset randomized prop
+        # reset randomized prop
         if self.cfg.domain_rand.randomize_kp:
             self.Kp_factors[env_ids] = torch_rand_float(self.cfg.domain_rand.kp_range[0], self.cfg.domain_rand.kp_range[1], (len(env_ids), 1), device=self.device)
         if self.cfg.domain_rand.randomize_kd:
@@ -254,15 +747,21 @@ class LeggedRobot(BaseTask):
         # add noise if needed
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[0:(9 + 3 * self.num_actions)]
-
-        # add perceptive inputs if not blind
+            
         current_obs = torch.cat((current_obs, self.base_lin_vel * self.obs_scales.lin_vel, self.disturbance[:, 0, :]), dim=-1)
+        
+        # add perceptive inputs if not blind
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements 
             heights += (2 * torch.rand_like(heights) - 1) * self.noise_scale_vec[(9 + 3 * self.num_actions):(9 + 3 * self.num_actions+187)]
             current_obs = torch.cat((current_obs, heights), dim=-1)
-
-        self.obs_buf = torch.cat((current_obs[:, :self.num_one_step_obs], self.obs_buf[:, :-self.num_one_step_obs]), dim=-1)
+        
+        self.proprioceptive_obs_buf = torch.cat((current_obs[:, :self.num_one_step_obs], self.proprioceptive_obs_buf[:, :-self.num_one_step_obs]), dim=-1)
+        if self.cfg.env.obs_with_lidar:
+            self.obs_buf = torch.cat((self.proprioceptive_obs_buf, heights), dim=-1)
+        else:
+            self.obs_buf = self.proprioceptive_obs_buf
+            
         self.privileged_obs_buf = torch.cat((current_obs[:, :self.num_one_step_privileged_obs], self.privileged_obs_buf[:, :-self.num_one_step_privileged_obs]), dim=-1)
 
     def get_current_obs(self):
@@ -276,14 +775,15 @@ class LeggedRobot(BaseTask):
         # add noise if needed
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[0:(9 + 3 * self.num_actions)]
-
-        # add perceptive inputs if not blind
+            
         current_obs = torch.cat((current_obs, self.base_lin_vel * self.obs_scales.lin_vel, self.disturbance[:, 0, :]), dim=-1)
+        
+        # add perceptive inputs if not blind
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements 
             heights += (2 * torch.rand_like(heights) - 1) * self.noise_scale_vec[(9 + 3 * self.num_actions):(9 + 3 * self.num_actions+187)]
             current_obs = torch.cat((current_obs, heights), dim=-1)
-
+            
         return current_obs
         
     def compute_termination_observations(self, env_ids):
@@ -299,14 +799,15 @@ class LeggedRobot(BaseTask):
         # add noise if needed
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[0:(9 + 3 * self.num_actions)]
-
-        # add perceptive inputs if not blind
+            
         current_obs = torch.cat((current_obs, self.base_lin_vel * self.obs_scales.lin_vel, self.disturbance[:, 0, :]), dim=-1)
+        # add perceptive inputs if not blind
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements 
             heights += (2 * torch.rand_like(heights) - 1) * self.noise_scale_vec[(9 + 3 * self.num_actions):(9 + 3 * self.num_actions+187)]
             current_obs = torch.cat((current_obs, heights), dim=-1)
-
+        
+        # return termination privileged obs
         return torch.cat((current_obs[:, :self.num_one_step_privileged_obs], self.privileged_obs_buf[:, :-self.num_one_step_privileged_obs]), dim=-1)[env_ids]
         
             
@@ -673,8 +1174,92 @@ class LeggedRobot(BaseTask):
         self.measured_heights = self._get_heights()
         self.base_height_points = self._init_base_height_points()
 
+
+        # # 体素地图光线投影初始化
+        #     # 设置 Raycast 参数
+        # num_rays_x = 40
+        # num_rays_y = 40
+        # grid_size = 4.0
+        # origin_z = 1.5
+        #     # 定义射线起点和方向
+        # x = torch.linspace(-grid_size/2, grid_size/2, num_rays_x)
+        # y = torch.linspace(-grid_size/2, grid_size/2, num_rays_y)
+        # xx, yy = torch.meshgrid(x, y, indexing="ij")
+        # self.origins = torch.stack([
+        #     xx.flatten(), yy.flatten(), torch.full_like(xx.flatten(), origin_z)
+        # ], dim=-1)
+        # self.dirs = torch.tensor([[0, 0, -1]]).repeat(self.origins.shape[0], 1)
+        #     # 拓展为 batch: batch_size=1
+        # self.origins = self.origins.unsqueeze(0).contiguous()
+        # self.dirs = self.dirs.unsqueeze(0).contiguous()
+        #     # GPU 分配
+        # self.origins_tensor = gymtorch.unwrap_tensor(self.origins.cuda())
+        # self.dirs_tensor = gymtorch.unwrap_tensor(self.dirs.cuda())
+        #     # 初始化 Raycast 结果缓存
+        # hits = torch.zeros_like(self.origins).cuda()
+
+
+        # # 体素地图光线投影初始化
+        #     # 射线参数
+        # num_rays_x = 40
+        # num_rays_y = 40
+        # grid_size = 4.0
+        # origin_z = 1.5
+        # self.target_env_id = 0  # 我们只关心第一个环境的体素地图
+        # # ==================== 构造射线 ====================
+        # x = torch.linspace(-grid_size / 2, grid_size / 2, num_rays_x)
+        # y = torch.linspace(-grid_size / 2, grid_size / 2, num_rays_y)
+        # xx, yy = torch.meshgrid(x, y, indexing="ij")
+        # xy_points = torch.stack([xx.flatten(), yy.flatten()], dim=-1)  # [N, 2]
+        # N = xy_points.shape[0]
+        # self.origins = []
+        # self.dirs_all = []
+        # for i in range(self.num_envs):
+        #     if i == self.target_env_id:
+        #         # 目标环境使用真实射线
+        #         z = torch.full((N,), origin_z)
+        #         origin_i = torch.cat([xy_points, z.unsqueeze(-1)], dim=-1)  # [N, 3]
+        #         dirs_i = torch.tensor([[0.0, 0.0, -1.0]]).repeat(N, 1)
+        #     else:
+        #         # 其他环境填充 dummy 射线（远处）
+        #         origin_i = torch.full((N, 3), 1000.0)
+        #         dirs_i = torch.tensor([[0.0, 0.0, -1.0]]).repeat(N, 1)
+        #     self.origins.append(origin_i)
+        #     self.dirs_all.append(dirs_i)
+        # # 转为 tensor
+        # self.origins = torch.stack(self.origins).cuda()       # [num_envs, N, 3]
+        # self.dirs_all = torch.stack(self.dirs_all).cuda()     # [num_envs, N, 3]
+        # self.origins_tensor = gymtorch.unwrap_tensor(self.origins.contiguous())
+        # self.dirs_tensor = gymtorch.unwrap_tensor(self.dirs_all.contiguous())
+
+
+        # 可通行性网格标签初始化
+        self.height_map = self.height_samples.cpu().numpy()
+
+        x = torch.tensor([-0.2, -0.1, 0, 0.1, 0.2], dtype=torch.float, device=self.device, requires_grad=False)
+        y = torch.tensor([-0.1, 0, 0.1], dtype=torch.float, device=self.device, requires_grad=False)
+        
+        grid_x, grid_y = torch.meshgrid(x, y)
+        num_points = grid_x.numel()
+        self.base_occupy_points = torch.zeros(num_points, 3, device=self.device, requires_grad=False)
+        self.base_occupy_points[:, 0] = grid_x.flatten()
+        self.base_occupy_points[:, 1] = grid_y.flatten()
+
+        rows, cols = self.height_samples.shape
+        self.num_succeed = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.num_fail = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.num_total = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.value_once = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.count_once = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.traversability_score = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.traversability_score_mean = torch.zeros((rows, cols), dtype=torch.float, device=self.device, requires_grad=False)
+        self.reset_count = torch.full((self.num_envs,), 15, dtype=torch.int, device=self.device, requires_grad=False)
+
+
+
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+        print(self.dof_names)
         for i in range(self.num_dofs):
             name = self.dof_names[i]
             angle = self.cfg.init_state.default_joint_angles[name]
@@ -948,7 +1533,7 @@ class LeggedRobot(BaseTask):
                 y = height_points[j, 1] + base_pos[1]
                 z = heights[j]
                 sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
 
     def _init_height_points(self):
         """ Returns points at which the height measurments are sampled (in base frame)
