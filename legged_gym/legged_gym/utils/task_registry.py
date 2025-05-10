@@ -98,6 +98,7 @@ class TaskRegistry():
                             sim_params=sim_params,
                             physics_engine=args.physics_engine,
                             sim_device=args.sim_device,
+                            graphics_device_id=args.graphics_device_id,
                             headless=args.headless)
         return env, env_cfg
 

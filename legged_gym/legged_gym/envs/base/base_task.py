@@ -38,7 +38,7 @@ import torch
 # Base class for RL tasks
 class BaseTask():
 
-    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
+    def __init__(self, cfg, sim_params, physics_engine, sim_device, graphics_device_id, headless):
         self.gym = gymapi.acquire_gym()
 
         self.sim_params = sim_params
@@ -54,7 +54,11 @@ class BaseTask():
             self.device = 'cpu'
 
         # graphics device for rendering, -1 for no rendering
-        self.graphics_device_id = self.sim_device_id
+        
+        # 渲染只能使用 GPU0，否则出现段错误
+        # self.graphics_device_id = graphics_device_id
+        self.graphics_device_id = 0
+
         if self.headless == True:
             self.graphics_device_id = -1
 
