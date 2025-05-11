@@ -28,6 +28,9 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import os
+import trimesh
+
 import numpy as np
 from numpy.random import choice
 from scipy import interpolate
@@ -83,6 +86,7 @@ class Terrain:
             self.add_terrain_to_map(terrain, i, j)
         
     def curiculum(self):
+        print(self.cfg.num_cols, self.cfg.num_rows)
         for j in range(self.cfg.num_cols):
             for i in range(self.cfg.num_rows):
                 difficulty = i / self.cfg.num_rows
@@ -121,26 +125,28 @@ class Terrain:
         gap_size = 1. * difficulty
         pit_depth = 1. * difficulty
         if choice < self.proportions[0]:
-            if choice < self.proportions[0]/ 2:
+            mesh_obj_terrain(terrain, difficulty, self.cfg.indoor_mesh_folder)
+        elif choice < self.proportions[1]:
+            if choice < self.proportions[1]/ 2:
                 slope *= -1
             terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.)
-        elif choice < self.proportions[1]:
+        elif choice < self.proportions[2]:
             terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.)
             terrain_utils.random_uniform_terrain(terrain, min_height=-amplitude, max_height=amplitude, step=0.005, downsampled_scale=0.2)
-        elif choice < self.proportions[3]:
-            if choice<self.proportions[2]:
+        elif choice < self.proportions[4]:
+            if choice<self.proportions[3]:
                 step_height *= -1
             terrain_utils.pyramid_stairs_terrain(terrain, step_width=0.30, step_height=step_height, platform_size=3.)
-        elif choice < self.proportions[4]:
+        elif choice < self.proportions[5]:
             num_rectangles = 20
             rectangle_min_size = 1.
             rectangle_max_size = 2.
             terrain_utils.discrete_obstacles_terrain(terrain, discrete_obstacles_height, rectangle_min_size, rectangle_max_size, num_rectangles, platform_size=3.)
-        elif choice < self.proportions[5]:
-            terrain_utils.stepping_stones_terrain(terrain, stone_size=stepping_stones_size, stone_distance=stone_distance, max_height=0., platform_size=4.)
         elif choice < self.proportions[6]:
+            terrain_utils.stepping_stones_terrain(terrain, stone_size=stepping_stones_size, stone_distance=stone_distance, max_height=0., platform_size=4.)
+        elif choice < self.proportions[7]:
             gap_terrain(terrain, gap_size=gap_size, platform_size=3.)
-        else:
+        elif choice < self.proportions[8]:
             pit_terrain(terrain, depth=pit_depth, platform_size=4.)
         
         return terrain
@@ -163,6 +169,29 @@ class Terrain:
         y2 = int((self.env_width/2. + 1) / terrain.horizontal_scale)
         env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2])*terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
+
+def mesh_obj_terrain(terrain, difficulty, mesh_folder):
+    difficulty_level = min(int(difficulty * 10), 9)
+    obj_path = os.path.join(mesh_folder, f"mesh_{difficulty_level}/mesh.obj")
+    if not os.path.exists(obj_path):
+        raise FileNotFoundError(f"OBJ file not found: {obj_path}")
+    
+    print(f"load mesh difficulty={difficulty_level}")
+
+    # 加载 mesh 并 raster 成高度图
+    mesh = trimesh.load(obj_path)
+    bounds = mesh.bounds
+
+    # 创建目标网格
+    width, length = terrain.width, terrain.length
+    x = np.linspace(bounds[0][0], bounds[1][0], width)
+    y = np.linspace(bounds[0][1], bounds[1][1], length)
+    xv, yv = np.meshgrid(x, y)
+    points = np.stack([xv.ravel(), yv.ravel(), np.zeros_like(xv).ravel()], axis=-1)
+
+    closest, _, _ = trimesh.proximity.closest_point(mesh, points)
+    heights = closest[:, 2].reshape(length, width)
+    terrain.height_field_raw[:, :] = (heights / terrain.vertical_scale).astype(np.int16)
 
 def gap_terrain(terrain, gap_size, platform_size=1.):
     gap_size = int(gap_size / terrain.horizontal_scale)
