@@ -124,6 +124,32 @@ class Go2RoughCfg( LeggedRobotCfg ):
         num_one_step_privileged_obs = 45 + 3 + 3 + 187 
         num_envs = 4096
 
+    class terrain(LeggedRobotCfg.terrain):
+    #     mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
+    #     horizontal_scale = 0.1 # [m]
+    #     vertical_scale = 0.005 # [m]
+    #     border_size = 25 # [m]
+    #     curriculum = True
+    #     static_friction = 1.0
+    #     dynamic_friction = 1.0
+    #     restitution = 0.
+    #     # rough terrain only:
+    #     measure_heights = True
+    #     measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] # 1mx1.6m rectangle (without center line)
+    #     measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
+    #     selected = False # select a unique terrain type and pass all arguments
+    #     terrain_kwargs = None # Dict of arguments for selected terrain
+    #     max_init_terrain_level = 5 # starting curriculum state
+        terrain_length = 12.
+        terrain_width = 12.
+    #     num_rows= 10 # number of terrain rows (levels)
+    #     num_cols = 20 # number of terrain cols (types)
+    #     # terrain types: [indoor, smooth slope, rough slope, stairs up, stairs down, discrete]
+    #     terrain_proportions = [0.1, 0.1, 0.2, 0.25, 0.25, 0.1]
+    #     # trimesh only:
+    #     slope_treshold = 0.75 # slopes above this threshold will be corrected to vertical surfaces
+    #     indoor_mesh_folder = "../../resources/terrian/indoor"
+
     # class viewer:
     #     ref_env = 0
     #     pos = [1.2, 0.0, 0.5]

@@ -55,6 +55,8 @@ legged_gym/logs
 logs
 runs
 
+traversability_voxel.ply
+
 # other
 *.egg-info
 __pycache__

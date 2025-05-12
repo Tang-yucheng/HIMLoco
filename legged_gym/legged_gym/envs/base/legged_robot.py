@@ -426,7 +426,7 @@ class LeggedRobot(BaseTask):
         flat.scatter_add_(0, linear_idx, torch.ones_like(linear_idx, dtype=flat.dtype))
 
     
-    def export_traversability_voxel(self, filename="/home/ubuntu/Desktop/traversability_voxel.ply"):
+    def export_traversability_voxel(self, filename="../../../traversability_voxel.ply"):
 
         if self._traversability_drawn or self.height_samples is None:
             return

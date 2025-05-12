@@ -1,0 +1,3 @@
+visualize=1
+voxel_map=1
+log=1

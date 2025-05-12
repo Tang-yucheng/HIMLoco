@@ -162,7 +162,7 @@ class BaseTask():
                 self.gym.poll_viewer_events(self.viewer)
 
 # 设置文件路径
-VIS_FLAG_PATH = "/home/ubuntu/Desktop/vis_flag.txt"
+VIS_FLAG_PATH = "../../../vis_flag.txt"
 
 def read_flags(path=VIS_FLAG_PATH):
     flags = {

@@ -171,27 +171,58 @@ class Terrain:
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
 
 def mesh_obj_terrain(terrain, difficulty, mesh_folder):
+
+    # if difficulty != 0:
+    #     return
     difficulty_level = min(int(difficulty * 10), 9)
     obj_path = os.path.join(mesh_folder, f"mesh_{difficulty_level}/mesh.obj")
+    # obj_path = os.path.join(mesh_folder, f"mesh_0/mesh.obj")
     if not os.path.exists(obj_path):
         raise FileNotFoundError(f"OBJ file not found: {obj_path}")
     
     print(f"load mesh difficulty={difficulty_level}")
 
     # 加载 mesh 并 raster 成高度图
-    mesh = trimesh.load(obj_path)
+    mesh = trimesh.load(obj_path, process=True)
     bounds = mesh.bounds
 
-    # 创建目标网格
+    print("Mesh X range:", mesh.bounds[0][0], "~", mesh.bounds[1][0])
+    print("Mesh Y range:", mesh.bounds[0][1], "~", mesh.bounds[1][1])
+    print("Mesh Z range:", mesh.bounds[0][2], "~", mesh.bounds[1][2])
+
+
+    # 射线原点从上空发出
     width, length = terrain.width, terrain.length
     x = np.linspace(bounds[0][0], bounds[1][0], width)
     y = np.linspace(bounds[0][1], bounds[1][1], length)
     xv, yv = np.meshgrid(x, y)
-    points = np.stack([xv.ravel(), yv.ravel(), np.zeros_like(xv).ravel()], axis=-1)
+    origins = np.stack([xv.ravel(), yv.ravel(), np.full_like(xv.ravel(), bounds[1][2] + 10.0)], axis=-1)  # z+10
+    directions = np.tile([0, 0, -1], (origins.shape[0], 1))  # 朝下射线
 
-    closest, _, _ = trimesh.proximity.closest_point(mesh, points)
-    heights = closest[:, 2].reshape(length, width)
-    terrain.height_field_raw[:, :] = (heights / terrain.vertical_scale).astype(np.int16)
+    # 使用 ray-triangle 交集模块
+    try:
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+    except ImportError:
+        from trimesh.ray.ray_triangle import RayMeshIntersector  # fallback
+
+    rmi = RayMeshIntersector(mesh)
+
+    # 求交点
+    locations, index_ray, index_tri = rmi.intersects_location(origins, directions, multiple_hits=True)
+
+    # 将多个交点合并成最高的
+    height_map = np.full((length * width), fill_value=np.nan)
+    for i in range(len(index_ray)):
+        ray_id = index_ray[i]
+        z = locations[i][2]
+        if np.isnan(height_map[ray_id]) or z > height_map[ray_id]:
+            height_map[ray_id] = z
+
+    height_map = height_map.reshape(length, width)
+    height_map = np.flipud(height_map)  # fix 上下镜像问题
+    height_map = np.rot90(height_map, k=1)  # 再逆时针旋转 90°，恢复原始方向
+    height_map = np.nan_to_num(height_map, nan=0.0)
+    terrain.height_field_raw[:, :] = (height_map / terrain.vertical_scale).astype(np.int16)
 
 def gap_terrain(terrain, gap_size, platform_size=1.):
     gap_size = int(gap_size / terrain.horizontal_scale)
