@@ -150,10 +150,10 @@ class Go2RoughCfg( LeggedRobotCfg ):
     #     slope_treshold = 0.75 # slopes above this threshold will be corrected to vertical surfaces
     #     indoor_mesh_folder = "../../resources/terrian/indoor"
 
-    # class viewer:
-    #     ref_env = 0
-    #     pos = [1.2, 0.0, 0.5]
-    #     lookat = [0.0, 0.0, 0.3]
+    class viewer(LeggedRobotCfg.viewer):
+        ref_env = 0
+        pos = [2, 0, 10]  # [m]
+        lookat = [11., 5, 3.]  # [m]
 
 class Go2RoughCfgPPO( LeggedRobotCfgPPO ):
     class algorithm( LeggedRobotCfgPPO.algorithm ):

@@ -92,8 +92,9 @@ class Terrain:
                 difficulty = i / self.cfg.num_rows
                 choice = j / self.cfg.num_cols + 0.001
 
-                terrain = self.make_terrain(choice, difficulty)
-                self.add_terrain_to_map(terrain, i, j)
+                # 增加terrian_type，来使得indoor地形重置区域采样范围更小，防止重置高度过大
+                terrain, terrian_type = self.make_terrain(choice, difficulty)
+                self.add_terrain_to_map(terrain, i, j, terrian_type)
 
     def selected_terrain(self):
         terrain_type = self.cfg.terrain_kwargs.pop('type')
@@ -124,7 +125,9 @@ class Terrain:
         stone_distance = 0.05 if difficulty==0 else 0.1
         gap_size = 1. * difficulty
         pit_depth = 1. * difficulty
+        terrain_type = "other"
         if choice < self.proportions[0]:
+            terrain_type = "indoor"
             mesh_obj_terrain(terrain, difficulty, self.cfg.indoor_mesh_folder)
         elif choice < self.proportions[1]:
             if choice < self.proportions[1]/ 2:
@@ -149,9 +152,9 @@ class Terrain:
         elif choice < self.proportions[8]:
             pit_terrain(terrain, depth=pit_depth, platform_size=4.)
         
-        return terrain
+        return terrain, terrain_type
 
-    def add_terrain_to_map(self, terrain, row, col):
+    def add_terrain_to_map(self, terrain, row, col, terrian_type):
         i = row
         j = col
         # map coordinate system
@@ -163,10 +166,19 @@ class Terrain:
 
         env_origin_x = (i + 0.5) * self.env_length
         env_origin_y = (j + 0.5) * self.env_width
-        x1 = int((self.env_length/2. - 1) / terrain.horizontal_scale)
-        x2 = int((self.env_length/2. + 1) / terrain.horizontal_scale)
-        y1 = int((self.env_width/2. - 1) / terrain.horizontal_scale)
-        y2 = int((self.env_width/2. + 1) / terrain.horizontal_scale)
+
+        if terrian_type == "indoor":
+            range_x = 0.1
+            range_y = 0.1
+        else:
+            range_x = 1
+            range_y = 1
+        print(range_x, range_y)
+
+        x1 = int((self.env_length/2. - range_x) / terrain.horizontal_scale)
+        x2 = int((self.env_length/2. + range_x) / terrain.horizontal_scale)
+        y1 = int((self.env_width/2. - range_y) / terrain.horizontal_scale)
+        y2 = int((self.env_width/2. + range_y) / terrain.horizontal_scale)
         env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2])*terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
 
